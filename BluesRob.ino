@@ -1,5 +1,6 @@
 #include <NesRob.h>
 #include <Notecard.h>
+#include <WiFi.h>
 
 #define productUID "com.blues.zfields:showcase"
 
@@ -20,7 +21,7 @@ static volatile bool notehub_request = false;
 static volatile bool soft_reset = false;
 
 // Globals
-static bool modem_active = false;
+static bool modem_active = true;
 static NesRob::Command cmd = NesRob::Command::LED_ENABLE;
 
 NesRob rob(S, NesRob::CommandTarget::MAIN_CPU);
@@ -87,6 +88,10 @@ int processRequest (void) {
  //** SETUP **
 //***********
 void setup() {
+  // Disable radios to improve power profile
+  WiFi.mode(WIFI_OFF);
+  btStop();
+
   // Debug LED
   digitalWrite(LED_BUILTIN, LOW);
   pinMode(LED_BUILTIN, OUTPUT);
@@ -149,7 +154,7 @@ void setup() {
   for (last_command_ms = millis() ; last_command_ms ;) {
     if (rob.sendCommand(NesRob::Command::LED_ENABLE)) {
       ::digitalWrite(LED_BUILTIN, LOW);
-      ::delay(100);
+      ::delay(IDLE_DELAY_MS);
       ::digitalWrite(LED_BUILTIN, HIGH);
     }
   }
@@ -171,17 +176,34 @@ void loop() {
   
   // Ready to process?
   if (last_command_ms) {
+    // Await idle delay
+    ::delay(IDLE_DELAY_MS);
     return;
   }
 
   // Button pressed?
   if (soft_reset) {
-    // empty queue
+    // Empty Queue
     if (emptyNotecardQueue()) {
 #if DEBUG
       notecard.logDebug("ERROR: Unable to empty queue!\n");
 #endif
     }
+
+    // Rearm ATTN Interrupt
+    if (J *req = NoteNewRequest("card.attn")) {
+      JAddStringToObject(req, "mode", "rearm,files");
+      if (J *files = JAddArrayToObject(req, "files")) {
+        JAddItemToArray(files, JCreateString("rob.qi"));
+        if (!notecard.sendRequest(req)) {
+#if DEBUG
+          notecard.logDebug("ERROR: Failed to rearm ATTN interrupt!\n");
+#endif
+        }
+      }
+    }
+
+    // Load RECALIBRATE Command
     cmd = NesRob::Command::RECALIBRATE;
 
   // Process queue
@@ -249,11 +271,11 @@ void loop() {
     }
   }
 
-  // Await modem
-  if (modem_active) {
-    //for(;modem_active;) {
-      // check modem status
-    //}
+  //TODO: Await modem
+  modem_active = true;
+  while (modem_active) {
+    ::delay(75);
+    modem_active = false;
   }
 
   // Issue command
@@ -270,11 +292,27 @@ void loop() {
       JAddStringToObject(req, "file", "rob.qi");
       JAddBoolToObject(req, "delete", true);
 
-      // Get Note
+      // Delete Processed Note
       if (!notecard.sendRequest(req)) {
 #if DEBUG
         notecard.logDebug("ERROR: Failed to delete Note!\n");
 #endif
+      }
+
+      // Check Queue
+      if (J *req = NoteNewRequest("note.get")) {
+        JAddStringToObject(req, "file", "rob.qi");
+        JAddBoolToObject(req, "delete", false);
+
+        // Check Note
+        if (notecard.sendRequest(req)) {
+          notehub_request = true;
+  #if DEBUG
+          notecard.logDebug("Discovered additional Note(s).\n");
+        } else {
+          notecard.logDebug("All Notes processed.\n");
+  #endif
+        }
       }
     }
   } else {
