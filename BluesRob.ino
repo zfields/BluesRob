@@ -15,7 +15,8 @@
 
 #define DEBUG 1
 #define IDLE_DELAY_MS 100
-#define PROCESSING_TIMEOUT_MS 7500
+#define MAX_COMMAND_RETRIES 3
+#define ROB_COMMAND_DELAY_MS 5
 
 #if DEBUG
 #define serialDebug Serial
@@ -27,6 +28,7 @@ static volatile bool notehub_request = false;
 static volatile bool soft_reset = false;
 
 // Globals
+bool retry_command = false;
 static NesRob::Command cmd = NesRob::Command::LED_ENABLE;
 
 NesRob rob(S, NesRob::CommandTarget::MAIN_CPU);
@@ -244,16 +246,30 @@ void setup() {
  //** LOOP **
 //**********
 void loop() {
-  // Check for processing timeout
-  if (last_command_ms && (::millis() - PROCESSING_TIMEOUT_MS) > last_command_ms) {
-    last_command_ms = 0;
-  }
-  
   // Ready to process?
   if (last_command_ms) {
-    // Await idle delay
-    ::delay(IDLE_DELAY_MS);
-    return;
+    static size_t retry_count = 0;
+
+    bool rob_working = !::digitalRead(L);
+    bool times_up = ((::millis() - ROB_COMMAND_DELAY_MS) > last_command_ms);
+
+    if (rob_working) {
+        // R.O.B. is executing a command
+        retry_count = 0;
+    }
+
+    if (!rob_working && times_up) {
+      // Failed to issue command
+      if (MAX_COMMAND_RETRIES > retry_count) {
+        ++retry_count;
+        retry_command = true;
+      }
+      last_command_ms = 0;
+    } else {
+      // Await idle delay
+      ::delay(IDLE_DELAY_MS);
+      return;
+    }
   }
 
   // Button pressed?
@@ -271,50 +287,50 @@ void loop() {
     // Load RECALIBRATE Command
     cmd = NesRob::Command::RECALIBRATE;
 
-  // Process queue
-  } else {
-    // Note in queue?
-    if (notehub_request) {
-      notehub_request = false;
-      if (J * rsp = dequeueCommand(false)) {
-        if (notecard.responseError(rsp)) {
-          notecard.logDebug("ERROR: Failed to acquire Note!\n");
-        } else {
-          // Process Note contents
-          if (JHasObjectItem(rsp,"body")) {
-            J * body_obj = JGetObjectItem(rsp, "body");
-            if (JHasObjectItem(body_obj,"cmd")) {
-              J * cmd_obj = JGetObjectItem(body_obj, "cmd");
+  // Reprocess dropped command
+  } else if (retry_command) {
 
-              if (JIsNumber(cmd_obj)) {
-                cmd = static_cast<NesRob::Command>(JNumberValue(cmd_obj));
-                notecard.logDebugf("Received command: 0x%x\n", cmd);
-              } else {
-                //notecard.logDebugf("ERROR: Command must be an integer type! Type provided: %s\n", JType(cmd_obj));
-                notecard.logDebugf("ERROR: Command must be an integer type! Type provided: %d\n", cmd_obj->type);
-              }
+  // Process queue
+  } else if (notehub_request) {
+    notehub_request = false;
+    if (J * rsp = dequeueCommand(false)) {
+      if (notecard.responseError(rsp)) {
+        notecard.logDebug("ERROR: Failed to acquire Note!\n");
+      } else {
+        // Process Note contents
+        if (JHasObjectItem(rsp,"body")) {
+          J * body_obj = JGetObjectItem(rsp, "body");
+          if (JHasObjectItem(body_obj,"cmd")) {
+            J * cmd_obj = JGetObjectItem(body_obj, "cmd");
+
+            if (JIsNumber(cmd_obj)) {
+              cmd = static_cast<NesRob::Command>(JNumberValue(cmd_obj));
+              notecard.logDebugf("Received command: 0x%x\n", cmd);
             } else {
-              notecard.logDebug("ERROR: Unrecognized Note format!\n");
+              //notecard.logDebugf("ERROR: Command must be an integer type! Type provided: %s\n", JType(cmd_obj));
+              notecard.logDebugf("ERROR: Command must be an integer type! Type provided: %d\n", cmd_obj->type);
             }
           } else {
             notecard.logDebug("ERROR: Unrecognized Note format!\n");
           }
+        } else {
+          notecard.logDebug("ERROR: Unrecognized Note format!\n");
         }
-        // Delete response
-        notecard.deleteResponse(rsp);
-      } else {
-        notecard.logDebug("ERROR: Notecard communication error!\n");
       }
-      
-      // Rearm ATTN Interrupt
-      if (armAttnInterrupt("rob.qi")) {
-        notecard.logDebug("ERROR: Failed to rearm ATTN interrupt!\n");
-      }
+      // Delete response
+      notecard.deleteResponse(rsp);
     } else {
-      // Await idle delay
-      ::delay(IDLE_DELAY_MS);
-      return;
+      notecard.logDebug("ERROR: Notecard communication error!\n");
     }
+
+    // Rearm ATTN Interrupt
+    if (armAttnInterrupt("rob.qi")) {
+      notecard.logDebug("ERROR: Failed to rearm ATTN interrupt!\n");
+    }
+  } else {
+    // Await idle delay
+    ::delay(IDLE_DELAY_MS);
+    return;
   }
 
   // Issue command to R.O.B.
@@ -323,15 +339,21 @@ void loop() {
     return;
   }
 
-  if (!soft_reset) {
-    // Delete Processed Note
-    if (J * rsp = dequeueCommand(true)) {
-      if (notecard.responseError(rsp)) {
-        notecard.logDebug("ERROR: Failed to delete Note!\n");
-      }
-      notecard.deleteResponse(rsp);
+  if (soft_reset) {
+    soft_reset = false;
+  } else {
+    if (retry_command) {
+      retry_command = false;
     } else {
-      notecard.logDebug("ERROR: Notecard communication error!\n");
+      // Delete Processed Note
+      if (J * rsp = dequeueCommand(true)) {
+        if (notecard.responseError(rsp)) {
+          notecard.logDebug("ERROR: Failed to delete Note!\n");
+        }
+        notecard.deleteResponse(rsp);
+      } else {
+        notecard.logDebug("ERROR: Notecard communication error!\n");
+      }
     }
 
     // Check Queue
@@ -346,7 +368,5 @@ void loop() {
     } else {
       notecard.logDebug("ERROR: Notecard communication error!\n");
     }
-  } else {
-    soft_reset = false;
   }
 }
