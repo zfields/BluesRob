@@ -118,6 +118,7 @@ int emptyNotecardQueue (void) {
   for (bool empty = false ; !empty ;) {
     if (J * rsp = dequeueCommand(true)) {
       if (notecard.responseError(rsp)) {
+        notehub_request = false;
         result = 0;
         empty = true;
       } else {
