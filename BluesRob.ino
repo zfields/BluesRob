@@ -29,6 +29,7 @@ static volatile bool soft_reset = false;
 
 // Globals
 bool retry_command = false;
+char command_guid[37] = {0};
 static NesRob::Command cmd = NesRob::Command::LED_ENABLE;
 
 NesRob rob(S, NesRob::CommandTarget::MAIN_CPU);
@@ -78,7 +79,8 @@ int armAttnInterrupt (const char * queue_) {
     }
   }
 
-  if (result < 0) {
+  if (0 > result) {
+    JDelete(req); // Recursively deletes nested objects and strings
     notecard.logDebug("FATAL: Unable to allocate request!\n");
     systemReset();
   }
@@ -103,9 +105,10 @@ J * dequeueCommand (bool pop_) {
     result = 0;
   }
 
-  if (result < 0) {
-    notecard.logDebug("FATAL: Unable to allocate request!\n");
+  if (0 > result) {
+    JDelete(req); // Recursively deletes nested objects and strings
     rsp = nullptr;
+    notecard.logDebug("FATAL: Unable to allocate request!\n");
     systemReset();
   }
 
@@ -198,16 +201,27 @@ void setup() {
   notecard.begin();
 
   // Configure Notecard
-  if (J *req = notecard.newRequest("hub.set")) {
-    JAddNumberToObject(req, "duration", 0);
-    JAddNumberToObject(req, "inbound", 5);
-    JAddStringToObject(req, "mode", "continuous");
-    JAddStringToObject(req, "product", productUID);
-    JAddBoolToObject(req, "sync", true);
-    if (!notecard.sendRequest(req)) {
-      notecard.logDebug("FATAL: Failed to configure Notecard!\n");
-      systemReset();
-    }
+  int result;
+  J *req;
+  if (!(req = notecard.newRequest("hub.set"))) {
+    result = -1;
+  } else if (!(JAddNumberToObject(req, "inbound", 5))) {
+    result = -2;
+  } else if (!(JAddStringToObject(req, "mode", "continuous"))) {
+    result = -3;
+  } else if (!(JAddStringToObject(req, "product", productUID))) {
+    result = -4;
+  } else if (!(JAddBoolToObject(req, "sync", true))) {
+    result = -5;
+  } else if (!notecard.sendRequest(req)) {
+    result = -6;
+  } else {
+    result = 0;
+  }
+  if (0 > result) {
+    JDelete(req); // Recursively deletes nested objects and strings
+    notecard.logDebugf("FATAL: Failed to configure Notecard! Reason: <%d>\n", result);
+    systemReset();
   }
 
   // Arm ATTN Interrupt
@@ -256,8 +270,36 @@ void loop() {
     bool times_up = ((::millis() - ROB_COMMAND_DELAY_MS) > last_command_ms);
 
     if (rob_working) {
-        // R.O.B. is executing a command
-        retry_count = 0;
+      // R.O.B. is executing a command
+      retry_count = 0;
+
+      // Report processed command guid to Notehub
+      if (*command_guid) {
+        int result;
+        J *req;
+        J *body;
+        if (!(req = notecard.newRequest("note.add"))) {
+          result = -1;
+        } else if (!(JAddStringToObject(req, "file", "rob.qo"))) {
+          result = -2;
+        } else if (!(JAddBoolToObject(req, "sync", true))) {
+          result = -3;
+        } else if (!(body = JAddObjectToObject(req, "body"))) {
+          result = -4;
+        } else if (!(JAddStringToObject(body, "guid", command_guid))) {
+          result = -5;
+        } else if (!notecard.sendRequest(req)) {
+          result = -6;
+        } else {
+          result = 0;
+        }
+        if (0 > result) {
+          JDelete(req); // Recursively deletes nested objects and strings
+          notecard.logDebugf("ERROR: Failed to send Note! Reason: <%d>\n", result);
+        }
+
+        *command_guid = '\0';
+      }
     }
 
     if (!rob_working && times_up) {
@@ -287,6 +329,7 @@ void loop() {
     }
 
     // Load RECALIBRATE Command
+    *command_guid = '\0';
     cmd = NesRob::Command::RECALIBRATE;
 
   // Reprocess dropped command
@@ -314,6 +357,19 @@ void loop() {
             }
           } else {
             notecard.logDebug("ERROR: Unrecognized Note format!\n");
+          }
+
+          if (JHasObjectItem(body_obj,"guid")) {
+            J * guid_obj = JGetObjectItem(body_obj, "guid");
+            if (JIsString(guid_obj)) {
+              ::strcpy(command_guid, JGetStringValue(guid_obj));
+              notecard.logDebugf("Processing command guid: %s\n", command_guid);
+            } else {
+              //notecard.logDebugf("ERROR: Note `guid` must be an GUID (string) type! Type provided: %s\n", JType(guid_obj));
+              notecard.logDebugf("ERROR: Note `guid` must be an GUID (string) type! Type provided: %d\n", guid_obj->type);
+            }
+          } else {
+            notecard.logDebug("ERROR: Missing `guid` field!\n");
           }
         } else {
           notecard.logDebug("ERROR: Unrecognized Note format!\n");
