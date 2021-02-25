@@ -199,7 +199,8 @@ void setup() {
 
   // Configure Notecard
   if (J *req = notecard.newRequest("hub.set")) {
-    JAddNumberToObject(req, "duration", 10);
+    JAddNumberToObject(req, "duration", 0);
+    JAddNumberToObject(req, "inbound", 5);
     JAddStringToObject(req, "mode", "continuous");
     JAddStringToObject(req, "product", productUID);
     JAddBoolToObject(req, "sync", true);
