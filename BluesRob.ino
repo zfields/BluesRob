@@ -23,7 +23,7 @@
 #endif
 
 // Interrupt variables
-static volatile int last_command_ms = 0;
+static volatile size_t last_command_ms = 0;
 static volatile bool notehub_request = false;
 static volatile bool soft_reset = false;
 
@@ -170,7 +170,8 @@ void systemReset (void) {
 #elif ARDUINO_ARCH_SAMD
   ::NVIC_SystemReset();
 #else
-  *(0);
+  void(*restart)(void) = nullptr;
+  restart();
 #endif
 }
 
