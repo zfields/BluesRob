@@ -13,12 +13,11 @@
 #define L D10
 #define S D11
 
-#define DEBUG 1
 #define IDLE_DELAY_MS 100
 #define MAX_COMMAND_RETRIES 3
 #define ROB_COMMAND_DELAY_MS 5
 
-#if DEBUG
+#ifndef NDEBUG
 #define serialDebug Serial
 #endif
 
@@ -30,6 +29,7 @@ static volatile bool soft_reset = false;
 // Globals
 bool retry_command = false;
 char command_guid[37] = {0};
+char signal_buffer[60] = {0};
 static NesRob::Command cmd = NesRob::Command::LED_ENABLE;
 
 NesRob rob(S, NesRob::CommandTarget::MAIN_CPU);
@@ -59,82 +59,105 @@ void ISR_softReset() {
   soft_reset = true;
 }
 
-int armAttnInterrupt (const char * queue_) {
+int armAttnInterrupt (void) {
   int result;
   J * req;
-  J * files;
 
-  if (!(req = NoteNewRequest("card.attn"))) {
+  if (!(req = notecard.newCommand("card.attn"))) {
     result = -1;
-  } else if (!(JAddStringToObject(req, "mode", "rearm,files"))) {
+  } else if (!(JAddStringToObject(req, "mode", "rearm,signal"))) {
     result = -2;
-  } else if (!(files = JAddArrayToObject(req, "files"))) {
+  } else if (!notecard.sendRequest(req)) {
     result = -3;
   } else {
-    JAddItemToArray(files, JCreateString(queue_));
-    if (!notecard.sendRequest(req)) {
-      result = 1;
-    } else {
-      result = 0;
-    }
-  }
-
-  if (0 > result) {
-    JDelete(req); // Recursively deletes nested objects and strings
-    notecard.logDebug("FATAL: Unable to allocate request!\n");
-    systemReset();
-  }
-
-  return result;
-}
-
-J * dequeueCommand (bool pop_) {
-  int result;
-  J * req;
-  J * rsp;
-
-  if (!(req = NoteNewRequest("note.get"))) {
-    result = -1;
-  } else if (!(JAddStringToObject(req, "file", "rob.qi"))) {
-    result = -2;
-  } else if (!(JAddBoolToObject(req, "delete", pop_))) {
-    result = -3;
-  } else {
-    // Get Note
-    rsp = notecard.requestAndResponse(req);
     result = 0;
   }
-
   if (0 > result) {
     JDelete(req); // Recursively deletes nested objects and strings
-    rsp = nullptr;
-    notecard.logDebug("FATAL: Unable to allocate request!\n");
-    systemReset();
-  }
-
-  return rsp;
-}
-
-int emptyNotecardQueue (void) {
-  int result;
-
-  for (bool empty = false ; !empty ;) {
-    if (J * rsp = dequeueCommand(true)) {
-      if (notecard.responseError(rsp)) {
-        notehub_request = false;
-        result = 0;
-        empty = true;
-      } else {
-        notecard.logDebugf("Deleted message with contents:\n\t> %s, JConvertToJSONString(rsp)");
-      }
-      notecard.deleteResponse(rsp);
-    } else {
-      notecard.logDebug("ERROR: Notecard communication error!\n");
-      ::delay(IDLE_DELAY_MS);
-    }
   }
 
   return result;
+}
+
+int configureNotecard (void) {
+  int result;
+  J *req;
+
+  if (!(req = notecard.newRequest("hub.set"))) {
+    result = -1;
+  } else if (!(JAddStringToObject(req, "mode", "continuous"))) {
+    result = -2;
+  } else if (!(JAddStringToObject(req, "product", productUID))) {
+    result = -3;
+  } else if (!(JAddBoolToObject(req, "sync", true))) {
+    result = -4;
+  } else if (!notecard.sendRequest(req)) {
+    result = -5;
+  } else {
+    result = 0;
+  }
+  if (0 > result) {
+    JDelete(req); // Recursively deletes nested objects and strings
+  }
+
+  return result;
+}
+
+J * captureSignal (void) {
+  J * result;
+
+  // Read in signal
+  const size_t signal_length = Serial1.readBytesUntil('\n', signal_buffer, (sizeof(signal_buffer)-1));
+  if (59 != signal_length) {
+    result = JParse("{\"err\":\"Unexpected signal length!\"}\r\n");
+  } else {
+    result = JParse(signal_buffer);
+  }
+
+  return result;
+}
+
+int enableSignalRequest (void) {
+  int result;
+  J * req;
+
+  // Configure UART
+  Serial1.begin(115200);
+  Serial1.setTimeout(10);
+
+  // Configure Notecard
+  if (!(req = notecard.newRequest("hub.signal"))) {
+    result = -1;
+  } else if (!(JAddBoolToObject(req, "on", true))) {
+    result = -2;
+  } else if (!notecard.sendRequest(req)) {
+    result = -3;
+  } else {
+    result = 0;
+  }
+  if (0 > result) {
+    JDelete(req); // Recursively deletes nested objects and strings
+  }
+
+  return result;
+}
+
+void emptyNotecardQueue (void) {
+  for (bool empty = false ; !empty ;) {
+    if (J * signal = captureSignal()) {
+      if (notecard.responseError(signal)) {
+        notehub_request = false;
+        empty = true;
+      } else {
+#ifndef NDEBUG
+        notecard.logDebugf("Deleted message with contents:\n\t> %s, JConvertToJSONString(rsp)");
+#endif
+      }
+      notecard.deleteResponse(signal);
+    }
+  }
+
+  return;
 }
 
 int processRequest (NesRob::Command cmd_) {
@@ -157,8 +180,31 @@ int processRequest (NesRob::Command cmd_) {
   return result;
 }
 
+int reportProcessedCommand (void) {
+  int result;
+  J *req;
+  J *body;
+
+  if (!(req = notecard.newCommand("hub.signal"))) {
+    result = -1;
+  } else if (!(body = JAddObjectToObject(req, "body"))) {
+    result = -2;
+  } else if (!(JAddStringToObject(body, "guid", command_guid))) {
+    result = -3;
+  } else if (!notecard.sendRequest(req)) {
+    result = -4;
+  } else {
+    result = 0;
+  }
+  if (0 > result) {
+    JDelete(req); // Recursively deletes nested objects and strings
+  }
+
+  return result;
+}
+
 void systemReset (void) {
-#if DEBUG
+#ifndef NDEBUG
   notecard.logDebug("INFO: Device reset requested.\n");
 #endif
 #ifdef ARDUINO_ARCH_AVR
@@ -189,7 +235,7 @@ void setup() {
   ::digitalWrite(LED_BUILTIN, LOW);
   ::pinMode(LED_BUILTIN, OUTPUT);
 
-#if DEBUG
+#ifndef NDEBUG
   // Initialize Debug Output
   serialDebug.begin(115200);
   while (!serialDebug) {
@@ -202,61 +248,53 @@ void setup() {
   notecard.begin();
 
   // Configure Notecard
-  int result;
-  J *req;
-  if (!(req = notecard.newRequest("hub.set"))) {
-    result = -1;
-  } else if (!(JAddNumberToObject(req, "inbound", 5))) {
-    result = -2;
-  } else if (!(JAddStringToObject(req, "mode", "continuous"))) {
-    result = -3;
-  } else if (!(JAddStringToObject(req, "product", productUID))) {
-    result = -4;
-  } else if (!(JAddBoolToObject(req, "sync", true))) {
-    result = -5;
-  } else if (!notecard.sendRequest(req)) {
-    result = -6;
-  } else {
-    result = 0;
-  }
-  if (0 > result) {
-    JDelete(req); // Recursively deletes nested objects and strings
-    notecard.logDebugf("FATAL: Failed to configure Notecard! Reason: <%d>\n", result);
+  if (configureNotecard()) {
+#ifndef NDEBUG
+    notecard.logDebug("FATAL: Failed to configure Notecard!\n");
+#endif
     systemReset();
-  }
+
+  // Enable Signal Requests
+  } else if (enableSignalRequest()) {
+#ifndef NDEBUG
+    notecard.logDebug("FATAL: Failed to enable signal requests!\n");
+#endif
+    systemReset();
 
   // Arm ATTN Interrupt
-  if (armAttnInterrupt("rob.qi")) {
-    notecard.logDebug("ERROR: Failed to rearm ATTN interrupt!\n");
-  }
+  } else if (armAttnInterrupt()) {
+#ifndef NDEBUG
+    notecard.logDebug("FATAL: Failed to rearm ATTN interrupt!\n");
+#endif
+    systemReset();
 
-  // Attach Notecard Interrupt
-  ::pinMode(D6, INPUT);
-  ::attachInterrupt(digitalPinToInterrupt(D6), ISR_notehubRequest, RISING);
+  } else {
+    // Attach R.O.B. Interrupt
+    ::pinMode(L, INPUT);
+    ::attachInterrupt(digitalPinToInterrupt(L), ISR_processingComplete, RISING);
 
-  // Attach R.O.B. Interrupt
-  ::pinMode(L, INPUT);
-  ::attachInterrupt(digitalPinToInterrupt(L), ISR_processingComplete, RISING);
+    // Empty Notecard Queue
+    emptyNotecardQueue();
 
-  // Empty Notecard Queue
-  if (emptyNotecardQueue()) {
-    notecard.logDebug("ERROR: Unable to empty queue!\n");
-  }
-
-  // Put R.O.B. into known state
-  ::digitalWrite(LED_BUILTIN, HIGH);
-  for (last_command_ms = millis() ; last_command_ms ;) {
-    if (rob.sendCommand(NesRob::Command::LED_ENABLE)) {
-      ::digitalWrite(LED_BUILTIN, LOW);
-      ::delay(IDLE_DELAY_MS);
-      ::digitalWrite(LED_BUILTIN, HIGH);
+    // Put R.O.B. into known state
+    ::digitalWrite(LED_BUILTIN, HIGH);
+    for (last_command_ms = millis() ; last_command_ms ;) {
+        if (rob.sendCommand(NesRob::Command::LED_ENABLE)) {
+        ::digitalWrite(LED_BUILTIN, LOW);
+        ::delay(IDLE_DELAY_MS);
+        ::digitalWrite(LED_BUILTIN, HIGH);
+        }
     }
-  }
-  ::digitalWrite(LED_BUILTIN, LOW);
+    ::digitalWrite(LED_BUILTIN, LOW);
 
-  // Attach Button Interrupt
-  ::pinMode(B0, INPUT_PULLUP);
-  ::attachInterrupt(digitalPinToInterrupt(B0), ISR_softReset, RISING);
+    // Attach Button Interrupt
+    ::pinMode(B0, INPUT_PULLUP);
+    ::attachInterrupt(digitalPinToInterrupt(B0), ISR_softReset, RISING);
+
+    // Attach Notecard Interrupt
+    ::pinMode(D6, INPUT);
+    ::attachInterrupt(digitalPinToInterrupt(D6), ISR_notehubRequest, RISING);
+  }
 }
 
   //**********
@@ -274,29 +312,12 @@ void loop() {
       // R.O.B. is executing a command
       retry_count = 0;
 
-      // Report processed command guid to Notehub
+      // Report processed command GUID to Notehub
       if (*command_guid) {
-        int result;
-        J *req;
-        J *body;
-        if (!(req = notecard.newRequest("note.add"))) {
-          result = -1;
-        } else if (!(JAddStringToObject(req, "file", "rob.qo"))) {
-          result = -2;
-        } else if (!(JAddBoolToObject(req, "sync", true))) {
-          result = -3;
-        } else if (!(body = JAddObjectToObject(req, "body"))) {
-          result = -4;
-        } else if (!(JAddStringToObject(body, "guid", command_guid))) {
-          result = -5;
-        } else if (!notecard.sendRequest(req)) {
-          result = -6;
-        } else {
-          result = 0;
-        }
-        if (0 > result) {
-          JDelete(req); // Recursively deletes nested objects and strings
-          notecard.logDebugf("ERROR: Failed to send Note! Reason: <%d>\n", result);
+        if (reportProcessedCommand()) {
+#ifndef NDEBUG
+          notecard.logDebug("ERROR: Failed to send Signal!\n");
+#endif
         }
 
         *command_guid = '\0';
@@ -319,14 +340,17 @@ void loop() {
 
   // Button pressed?
   if (soft_reset) {
+    // Clear flags
+    retry_command = false;
+
     // Empty Queue
-    if (emptyNotecardQueue()) {
-      notecard.logDebug("ERROR: Unable to empty queue!\n");
-    }
+    emptyNotecardQueue();
 
     // Rearm ATTN Interrupt
-    if (armAttnInterrupt("rob.qi")) {
+    if (armAttnInterrupt()) {
+#ifndef NDEBUG
       notecard.logDebug("ERROR: Failed to rearm ATTN interrupt!\n");
+#endif
     }
 
     // Load RECALIBRATE Command
@@ -339,52 +363,63 @@ void loop() {
   // Process queue
   } else if (notehub_request) {
     notehub_request = false;
-    if (J * rsp = dequeueCommand(false)) {
-      if (notecard.responseError(rsp)) {
-        notecard.logDebug("ERROR: Failed to acquire Note!\n");
+    if (J * signal = captureSignal()) {
+      if (notecard.responseError(signal)) {
+#ifndef NDEBUG
+        notecard.logDebug("ERROR: Unrecognized signal format!\n");
+#endif
       } else {
-        // Process Note contents
-        if (JHasObjectItem(rsp,"body")) {
-          J * body_obj = JGetObjectItem(rsp, "body");
-          if (JHasObjectItem(body_obj,"cmd")) {
-            J * cmd_obj = JGetObjectItem(body_obj, "cmd");
+        // Process signal contents
+        if (JHasObjectItem(signal,"cmd")) {
+          J * cmd_obj = JGetObjectItem(signal, "cmd");
 
-            if (JIsNumber(cmd_obj)) {
-              cmd = static_cast<NesRob::Command>(JNumberValue(cmd_obj));
-              notecard.logDebugf("Received command: 0x%x\n", cmd);
-            } else {
-              //notecard.logDebugf("ERROR: Command must be an integer type! Type provided: %s\n", JType(cmd_obj));
-              notecard.logDebugf("ERROR: Command must be an integer type! Type provided: %d\n", cmd_obj->type);
-            }
+          if (JIsNumber(cmd_obj)) {
+            cmd = static_cast<NesRob::Command>(JNumberValue(cmd_obj));
+#ifndef NDEBUG
+            notecard.logDebugf("Received command: 0x%x\n", cmd);
+#endif
           } else {
-            notecard.logDebug("ERROR: Unrecognized Note format!\n");
-          }
-
-          if (JHasObjectItem(body_obj,"guid")) {
-            J * guid_obj = JGetObjectItem(body_obj, "guid");
-            if (JIsString(guid_obj)) {
-              ::strcpy(command_guid, JGetStringValue(guid_obj));
-              notecard.logDebugf("Processing command guid: %s\n", command_guid);
-            } else {
-              //notecard.logDebugf("ERROR: Note `guid` must be an GUID (string) type! Type provided: %s\n", JType(guid_obj));
-              notecard.logDebugf("ERROR: Note `guid` must be an GUID (string) type! Type provided: %d\n", guid_obj->type);
-            }
-          } else {
-            notecard.logDebug("ERROR: Missing `guid` field!\n");
+#ifndef NDEBUG
+            notecard.logDebugf("ERROR: Command must be an integer type! Type provided: %s\n", JType(cmd_obj));
+#endif
           }
         } else {
-          notecard.logDebug("ERROR: Unrecognized Note format!\n");
+#ifndef NDEBUG
+          notecard.logDebug("ERROR: Missing `cmd` field!\n");
+#endif
+        }
+
+        if (JHasObjectItem(signal,"guid")) {
+          J * guid_obj = JGetObjectItem(signal, "guid");
+          if (JIsString(guid_obj)) {
+            ::strcpy(command_guid, JGetStringValue(guid_obj));
+#ifndef NDEBUG
+            notecard.logDebugf("Processing command guid: %s\n", command_guid);
+#endif
+          } else {
+#ifndef NDEBUG
+            notecard.logDebugf("ERROR: Note `guid` must be an GUID (string) type! Type provided: %s\n", JType(guid_obj));
+#endif
+          }
+        } else {
+#ifndef NDEBUG
+          notecard.logDebug("ERROR: Missing `guid` field!\n");
+#endif
         }
       }
       // Delete response
-      notecard.deleteResponse(rsp);
+      notecard.deleteResponse(signal);
     } else {
+#ifndef NDEBUG
       notecard.logDebug("ERROR: Notecard communication error!\n");
+#endif
     }
 
     // Rearm ATTN Interrupt
-    if (armAttnInterrupt("rob.qi")) {
+    if (armAttnInterrupt()) {
+#ifndef NDEBUG
       notecard.logDebug("ERROR: Failed to rearm ATTN interrupt!\n");
+#endif
     }
   } else {
     // Await idle delay
@@ -394,7 +429,9 @@ void loop() {
 
   // Issue command to R.O.B.
   if (processRequest(cmd)) {
+#ifndef NDEBUG
     notecard.logDebug("ERROR: Failed to command R.O.B.!\n");
+#endif
     return;
   }
 
@@ -403,29 +440,16 @@ void loop() {
   } else {
     if (retry_command) {
       retry_command = false;
-    } else {
-      // Delete Processed Note
-      if (J * rsp = dequeueCommand(true)) {
-        if (notecard.responseError(rsp)) {
-          notecard.logDebug("ERROR: Failed to delete Note!\n");
-        }
-        notecard.deleteResponse(rsp);
-      } else {
-        notecard.logDebug("ERROR: Notecard communication error!\n");
-      }
     }
 
     // Check Queue
-    if (J * rsp = dequeueCommand(false)) {
-      if (notecard.responseError(rsp)) {
-        notecard.logDebug("All Notes processed.\n");
-      } else {
-        notehub_request = true;
-        notecard.logDebug("Discovered additional Note(s).\n");
-      }
-      notecard.deleteResponse(rsp);
+    notehub_request = Serial1.available();
+#ifndef NDEBUG
+    if (notehub_request) {
+      notecard.logDebug("Discovered additional Note(s).\n");
     } else {
-      notecard.logDebug("ERROR: Notecard communication error!\n");
+      notecard.logDebug("All Notes processed.\n");
     }
+#endif
   }
 }
