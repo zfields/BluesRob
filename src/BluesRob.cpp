@@ -1,5 +1,6 @@
 #include <NesRob.h>
 #include <Notecard.h>
+#include <Notecarrier.h>
 
 // Include architecture specific headers
 #ifdef ARDUINO_ARCH_AVR
@@ -13,13 +14,16 @@
 #define L D10
 #define S D11
 
-#define DEBUG 1
 #define IDLE_DELAY_MS 100
 #define MAX_COMMAND_RETRIES 3
 #define ROB_COMMAND_DELAY_MS 5
 
-#if DEBUG
-#define serialDebug Serial
+#ifdef ARDUINO_ARCH_STM32
+#define INT_BTN USER_BTN
+HardwareSerial debugSerial(PIN_VCP_RX, PIN_VCP_TX);
+#else
+#define INT_BTN B0
+#define debugSerial Serial
 #endif
 
 // Interrupt variables
@@ -35,6 +39,10 @@ static NesRob::Command cmd = NesRob::Command::LED_ENABLE;
 NesRob rob(S, NesRob::CommandTarget::MAIN_CPU);
 Notecard notecard;
 
+// Function declarations
+void systemReset (void);
+
+// Interrupt Service Routines
 #ifdef ARDUINO_ARCH_ESP32
 void IRAM_ATTR ISR_notehubRequest() {
 #else
@@ -59,6 +67,7 @@ void ISR_softReset() {
   soft_reset = true;
 }
 
+// Function definitions
 int armAttnInterrupt (const char * queue_) {
   int result;
   J * req;
@@ -158,9 +167,7 @@ int processRequest (NesRob::Command cmd_) {
 }
 
 void systemReset (void) {
-#if DEBUG
   notecard.logDebug("INFO: Device reset requested.\n");
-#endif
 #ifdef ARDUINO_ARCH_AVR
   softwareReset::standard();
 #elif ARDUINO_ARCH_ESP32
@@ -189,13 +196,17 @@ void setup() {
   ::digitalWrite(LED_BUILTIN, LOW);
   ::pinMode(LED_BUILTIN, OUTPUT);
 
-#if DEBUG
-  // Initialize Debug Output
-  serialDebug.begin(115200);
-  while (!serialDebug) {
-    ; // wait for serial port to connect. Needed for native USB
-  }
-  notecard.setDebugOutputStream(serialDebug);
+#ifndef RELEASE
+#warning "Debug mode is enabled. Define RELEASE to disable debug."
+    // Initialize Debug Output
+    debugSerial.begin(115200);
+    static const size_t MAX_SERIAL_WAIT_MS = 5000;
+    size_t begin_serial_wait_ms = ::millis();
+    while (!debugSerial && (MAX_SERIAL_WAIT_MS > (::millis() - begin_serial_wait_ms)))
+    {
+        ; // wait for debug serial port to connect. Needed for native USB
+    }
+    notecard.setDebugOutputStream(debugSerial);
 #endif
 
   // Initialize Notecard
@@ -206,16 +217,18 @@ void setup() {
   J *req;
   if (!(req = notecard.newRequest("hub.set"))) {
     result = -1;
-  } else if (!(JAddNumberToObject(req, "inbound", 5))) {
+  } else if (!(JAddStringToObject(req, "sn", "R.O.B."))) {
     result = -2;
-  } else if (!(JAddStringToObject(req, "mode", "continuous"))) {
+  } else if (!(JAddNumberToObject(req, "inbound", 5))) {
     result = -3;
-  } else if (!(JAddStringToObject(req, "product", productUID))) {
+  } else if (!(JAddStringToObject(req, "mode", "continuous"))) {
     result = -4;
-  } else if (!(JAddBoolToObject(req, "sync", true))) {
+  } else if (!(JAddStringToObject(req, "product", productUID))) {
     result = -5;
-  } else if (!notecard.sendRequest(req)) {
+  } else if (!(JAddBoolToObject(req, "sync", true))) {
     result = -6;
+  } else if (!notecard.sendRequest(req)) {
+    result = -7;
   } else {
     result = 0;
   }
@@ -247,6 +260,7 @@ void setup() {
   ::digitalWrite(LED_BUILTIN, HIGH);
   for (last_command_ms = millis() ; last_command_ms ;) {
     if (rob.sendCommand(NesRob::Command::LED_ENABLE)) {
+      ::delay(IDLE_DELAY_MS);
       ::digitalWrite(LED_BUILTIN, LOW);
       ::delay(IDLE_DELAY_MS);
       ::digitalWrite(LED_BUILTIN, HIGH);
@@ -255,8 +269,8 @@ void setup() {
   ::digitalWrite(LED_BUILTIN, LOW);
 
   // Attach Button Interrupt
-  ::pinMode(B0, INPUT_PULLUP);
-  ::attachInterrupt(digitalPinToInterrupt(B0), ISR_softReset, RISING);
+  ::pinMode(INT_BTN, INPUT_PULLUP);
+  ::attachInterrupt(digitalPinToInterrupt(INT_BTN), ISR_softReset, RISING);
 }
 
   //**********
